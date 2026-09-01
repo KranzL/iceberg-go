@@ -62,8 +62,9 @@ type producerImpl interface {
 	// ErrCommit* sentinel on conflict, ErrCommitDiverged on terminal
 	// divergence, or nil on success. A no-op default is fine for
 	// producers that are safe against concurrent appends (fast-append
-	// and merge-append).
-	validate(cc *conflictContext) error
+	// and merge-append). ctx bounds the validation's manifest reads;
+	// cancelling it aborts the remaining checks.
+	validate(ctx context.Context, cc *conflictContext) error
 	// needsValidation reports whether this producer's validate method
 	// performs real conflict checks. Return false only if validate is
 	// unconditionally a no-op; commit() skips validator registration
@@ -126,7 +127,7 @@ func (fa *fastAppendFiles) deletedEntries(_ context.Context, _ *Snapshot) ([]ice
 // same file path is a writer-side error (paths are expected to be
 // unique, normally via UUID-stamped filenames); detecting it here
 // is out of Java parity scope.
-func (fa *fastAppendFiles) validate(_ *conflictContext) error {
+func (fa *fastAppendFiles) validate(context.Context, *conflictContext) error {
 	return nil
 }
 
@@ -262,7 +263,7 @@ func (of *overwriteFiles) existingManifests(parent *Snapshot) ([]iceberg.Manifes
 // lation-level otherwise. SNAPSHOT returns nil — concurrent appends
 // are allowed. SERIALIZABLE runs validateAddedDataFilesMatchingFilter
 // against the committer's filter (AlwaysTrue when no filter is set).
-func (of *overwriteFiles) validate(cc *conflictContext) error {
+func (of *overwriteFiles) validate(ctx context.Context, cc *conflictContext) error {
 	// Delete operations (copy-on-write / merge-on-read deletes that
 	// run through overwriteFiles) must read write.delete.isolation-
 	// level, not write.update.isolation-level. Java's BaseDeleteFiles
@@ -290,7 +291,7 @@ func (of *overwriteFiles) validate(cc *conflictContext) error {
 		filter = iceberg.AlwaysTrue{}
 	}
 
-	return validateAddedDataFilesMatchingFilter(cc, filter)
+	return validateAddedDataFilesMatchingFilter(ctx, cc, filter)
 }
 
 func (of *overwriteFiles) deletedEntries(ctx context.Context, parent *Snapshot) ([]iceberg.ManifestEntry, error) {
@@ -1478,8 +1479,8 @@ func (sp *snapshotProducer) commitManifests(newManifests, addedContent []iceberg
 	// == false and skip registration entirely. The nil guard remains for
 	// unit tests that drive commit() on a bare snapshotProducer.
 	if impl := sp.producerImpl; impl != nil && impl.needsValidation() {
-		sp.txn.validators = append(sp.txn.validators, func(cc *conflictContext) error {
-			return impl.validate(cc)
+		sp.txn.validators = append(sp.txn.validators, func(ctx context.Context, cc *conflictContext) error {
+			return impl.validate(ctx, cc)
 		})
 	}
 

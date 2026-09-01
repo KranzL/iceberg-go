@@ -102,7 +102,7 @@ func BenchmarkConflictValidationSharedManifestReads(b *testing.B) {
 					// within that attempt share the context and its cache.
 					ctx := &conflictContext{fs: baseContext.fs, concurrent: baseContext.concurrent}
 					for range validatorCount {
-						if err := ctx.forEachAddedEntry(iceberg.ManifestContentData, visit); err != nil {
+						if err := ctx.forEachAddedEntry(b.Context(), iceberg.ManifestContentData, visit); err != nil {
 							b.Fatal(err)
 						}
 					}
@@ -130,11 +130,11 @@ func BenchmarkConflictValidationMixedValidators(b *testing.B) {
 					fs:         baseContext.fs,
 					concurrent: baseContext.concurrent,
 				}
-				if err := validateDataFilesExist(ctx, []string{referencedPath}); err != nil {
+				if err := validateDataFilesExist(b.Context(), ctx, []string{referencedPath}); err != nil {
 					b.Fatal(err)
 				}
 
-				err := validateAddedDataFilesMatchingFilter(ctx, iceberg.AlwaysTrue{})
+				err := validateAddedDataFilesMatchingFilter(b.Context(), ctx, iceberg.AlwaysTrue{})
 				if !errors.Is(err, ErrConflictingDataFiles) {
 					b.Fatalf("validateAddedDataFilesMatchingFilter() error = %v", err)
 				}

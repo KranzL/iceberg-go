@@ -103,16 +103,16 @@ func newTestEqDeleteFile(t *testing.T, path string, eqIDs []int) iceberg.DataFil
 
 func TestFastAppendFiles_ValidateNoop(t *testing.T) {
 	fa := &fastAppendFiles{}
-	require.NoError(t, fa.validate(nil))
-	require.NoError(t, fa.validate(newEmptyConflictContext(t)))
+	require.NoError(t, fa.validate(t.Context(), nil))
+	require.NoError(t, fa.validate(t.Context(), newEmptyConflictContext(t)))
 }
 
 // mergeAppendFiles has its own explicit needsValidation() and validate()
 // methods. Pin the behavior so a future refactor doesn't silently drop it.
 func TestMergeAppendFiles_ValidateNoop(t *testing.T) {
 	ma := &mergeAppendFiles{}
-	require.NoError(t, ma.validate(nil))
-	require.NoError(t, ma.validate(newEmptyConflictContext(t)))
+	require.NoError(t, ma.validate(t.Context(), nil))
+	require.NoError(t, ma.validate(t.Context(), newEmptyConflictContext(t)))
 	require.False(t, ma.needsValidation())
 
 	var _ producerImpl = ma
@@ -126,13 +126,13 @@ func TestOverwriteFiles_ValidateEmptyConcurrent(t *testing.T) {
 	txn := newValidateTestTxn(t, nil)
 
 	of := &overwriteFiles{base: &snapshotProducer{txn: txn}}
-	require.NoError(t, of.validate(cc), "nil filter")
+	require.NoError(t, of.validate(t.Context(), cc), "nil filter")
 
 	of.filter = iceberg.AlwaysTrue{}
-	require.NoError(t, of.validate(cc), "AlwaysTrue filter")
+	require.NoError(t, of.validate(t.Context(), cc), "AlwaysTrue filter")
 
 	of.filter = iceberg.EqualTo(iceberg.Reference("id"), int64(42))
-	require.NoError(t, of.validate(cc), "bounded filter")
+	require.NoError(t, of.validate(t.Context(), cc), "bounded filter")
 }
 
 // TestOverwriteFiles_ValidateSkipFlag proves the skip flag suppresses
@@ -142,7 +142,7 @@ func TestOverwriteFiles_ValidateSkipFlag(t *testing.T) {
 	cc := newEmptyConflictContext(t)
 	txn := newValidateTestTxn(t, nil)
 	of := &overwriteFiles{base: &snapshotProducer{txn: txn}, skipDefaultValidator: true}
-	require.NoError(t, of.validate(cc))
+	require.NoError(t, of.validate(t.Context(), cc))
 }
 
 // TestOverwriteFiles_IsolationKeySplitByOp pins the Java-parity M1
@@ -189,7 +189,7 @@ func TestOverwriteFiles_ValidateInvalidIsolationLevel(t *testing.T) {
 	})
 	of := &overwriteFiles{base: &snapshotProducer{txn: txn}}
 
-	assert.ErrorIs(t, of.validate(cc), ErrInvalidIsolationLevel)
+	assert.ErrorIs(t, of.validate(t.Context(), cc), ErrInvalidIsolationLevel)
 }
 
 func TestOverwriteFiles_ValidateInvalidDeleteIsolationLevel(t *testing.T) {
@@ -199,7 +199,7 @@ func TestOverwriteFiles_ValidateInvalidDeleteIsolationLevel(t *testing.T) {
 	})
 	of := &overwriteFiles{base: &snapshotProducer{txn: txn, op: OpDelete}}
 
-	assert.ErrorIs(t, of.validate(cc), ErrInvalidIsolationLevel)
+	assert.ErrorIs(t, of.validate(t.Context(), cc), ErrInvalidIsolationLevel)
 }
 
 func TestOverwriteFiles_ValidateInvalidIsolationLevelWithNilContext(t *testing.T) {
@@ -208,7 +208,7 @@ func TestOverwriteFiles_ValidateInvalidIsolationLevelWithNilContext(t *testing.T
 	})
 	of := &overwriteFiles{base: &snapshotProducer{txn: txn}}
 
-	assert.ErrorIs(t, of.validate(nil), ErrInvalidIsolationLevel)
+	assert.ErrorIs(t, of.validate(t.Context(), nil), ErrInvalidIsolationLevel)
 }
 
 // TestOverwriteFiles_ValidateNilContext hardens validate against a
@@ -217,14 +217,14 @@ func TestOverwriteFiles_ValidateInvalidIsolationLevelWithNilContext(t *testing.T
 func TestOverwriteFiles_ValidateNilContext(t *testing.T) {
 	txn := newValidateTestTxn(t, nil)
 	of := &overwriteFiles{base: &snapshotProducer{txn: txn}}
-	require.NoError(t, of.validate(nil))
+	require.NoError(t, of.validate(t.Context(), nil))
 }
 
 func TestRowDelta_ValidateNoDeletes(t *testing.T) {
 	cc := newEmptyConflictContext(t)
 	txn := newValidateTestTxn(t, nil)
 	rd := &RowDelta{txn: txn}
-	require.NoError(t, rd.validate(cc))
+	require.NoError(t, rd.validate(t.Context(), cc))
 }
 
 // TestRowDelta_ValidatePosDeleteWithoutReference covers the realistic
@@ -236,7 +236,7 @@ func TestRowDelta_ValidatePosDeleteWithoutReference(t *testing.T) {
 	txn := newValidateTestTxn(t, nil)
 	posDelete := newTestPosDeleteFile(t, "pos-1.parquet", nil)
 	rd := &RowDelta{txn: txn, delFiles: []iceberg.DataFile{posDelete}}
-	require.NoError(t, rd.validate(cc))
+	require.NoError(t, rd.validate(t.Context(), cc))
 }
 
 // TestRowDelta_ValidateEqDeleteIsolationGates proves the isolation
@@ -253,7 +253,7 @@ func TestRowDelta_ValidateEqDeleteIsolationGates(t *testing.T) {
 			WriteDeleteIsolationLevelKey: string(level),
 		})
 		rd := &RowDelta{txn: txn, delFiles: []iceberg.DataFile{eqDelete}}
-		require.NoError(t, rd.validate(cc), "%s + no concurrent should be nil", level)
+		require.NoError(t, rd.validate(t.Context(), cc), "%s + no concurrent should be nil", level)
 	}
 }
 
@@ -267,7 +267,7 @@ func TestRowDelta_ValidateInvalidIsolationLevel(t *testing.T) {
 	})
 	rd := &RowDelta{txn: txn, delFiles: []iceberg.DataFile{eqDelete}}
 
-	assert.ErrorIs(t, rd.validate(cc), ErrInvalidIsolationLevel)
+	assert.ErrorIs(t, rd.validate(t.Context(), cc), ErrInvalidIsolationLevel)
 }
 
 func TestRowDelta_ValidateInvalidIsolationLevelWithPosDeletesOnly(t *testing.T) {
@@ -278,7 +278,7 @@ func TestRowDelta_ValidateInvalidIsolationLevelWithPosDeletesOnly(t *testing.T) 
 	})
 	rd := &RowDelta{txn: txn, delFiles: []iceberg.DataFile{posDelete}}
 
-	assert.ErrorIs(t, rd.validate(cc), ErrInvalidIsolationLevel)
+	assert.ErrorIs(t, rd.validate(t.Context(), cc), ErrInvalidIsolationLevel)
 }
 
 func TestRowDelta_ValidateInvalidIsolationLevelWithNilContext(t *testing.T) {
@@ -287,17 +287,17 @@ func TestRowDelta_ValidateInvalidIsolationLevelWithNilContext(t *testing.T) {
 	})
 	rd := &RowDelta{txn: txn}
 
-	assert.ErrorIs(t, rd.validate(nil), ErrInvalidIsolationLevel)
+	assert.ErrorIs(t, rd.validate(t.Context(), nil), ErrInvalidIsolationLevel)
 }
 
 func TestRewriteValidator_Smokes(t *testing.T) {
 	cc := newEmptyConflictContext(t)
 
 	// Empty rewrittenFiles short-circuits regardless of cc.
-	require.NoError(t, rewriteValidator(nil)(cc))
-	require.NoError(t, rewriteValidator(nil)(nil))
+	require.NoError(t, rewriteValidator(nil)(t.Context(), cc))
+	require.NoError(t, rewriteValidator(nil)(t.Context(), nil))
 
 	// Non-empty files but zero concurrent snapshots is also nil.
 	rewritten := newTestDataFile(t, *iceberg.UnpartitionedSpec, "a.parquet", nil)
-	require.NoError(t, rewriteValidator([]iceberg.DataFile{rewritten})(cc))
+	require.NoError(t, rewriteValidator([]iceberg.DataFile{rewritten})(t.Context(), cc))
 }

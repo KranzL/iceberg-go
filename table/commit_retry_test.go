@@ -671,7 +671,7 @@ func TestDoCommit_OrphanCleanedOnCommitDiverged(t *testing.T) {
 	}
 	tbl = newOCCTable(t, meta, wfs, cat)
 
-	divergedValidator := func(*conflictContext) error { return ErrCommitDiverged }
+	divergedValidator := func(context.Context, *conflictContext) error { return ErrCommitDiverged }
 
 	_, err = tbl.doCommit(t.Context(), updates, reqs,
 		withCommitBranch(MainBranch),

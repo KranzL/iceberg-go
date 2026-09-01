@@ -756,15 +756,15 @@ func rewriteValidatorWithReferencedDataFiles(
 	rewrittenFiles []iceberg.DataFile,
 	referencedDataFilePaths []string,
 ) conflictValidatorFunc {
-	return func(cc *conflictContext) error {
+	return func(ctx context.Context, cc *conflictContext) error {
 		if cc == nil {
 			return nil
 		}
-		if err := validateDataFilesExist(cc, referencedDataFilePaths); err != nil {
+		if err := validateDataFilesExist(ctx, cc, referencedDataFilePaths); err != nil {
 			return err
 		}
 
-		return validateNoNewDeletesForRewrittenFiles(cc, rewrittenFiles)
+		return validateNoNewDeletesForRewrittenFiles(ctx, cc, rewrittenFiles)
 	}
 }
 

@@ -160,7 +160,7 @@ func TestDoCommit_RefreshAndReplaySucceedsAfterPeerAdvance(t *testing.T) {
 		func(context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil }, cat)
 
 	reqs := []Requirement{AssertRefSnapshotID(MainBranch, &writerHead)}
-	noOpValidator := func(*conflictContext) error { return nil }
+	noOpValidator := func(context.Context, *conflictContext) error { return nil }
 
 	_, err := tbl.doCommit(context.Background(), nil, reqs,
 		withCommitBranch(MainBranch),
@@ -195,7 +195,7 @@ func TestDoCommit_ValidatorRejectsOnRefresh(t *testing.T) {
 	// otherwise the validator would also fire on attempt 0 (where
 	// base == current and cc.concurrent is empty), and the test
 	// would not be exercising the refresh-and-replay path.
-	rejectOnConcurrent := func(cc *conflictContext) error {
+	rejectOnConcurrent := func(_ context.Context, cc *conflictContext) error {
 		if len(cc.concurrent) > 0 {
 			return ErrConflictingDataFiles
 		}

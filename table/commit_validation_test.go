@@ -99,7 +99,7 @@ func newValidationTestTable(t *testing.T, props iceberg.Properties) (*Table, *co
 func TestDoCommit_ValidatorRejectsTerminatesPreFlight(t *testing.T) {
 	tbl, cat := newValidationTestTable(t, nil)
 
-	reject := func(cc *conflictContext) error { return ErrConflictingDataFiles }
+	reject := func(context.Context, *conflictContext) error { return ErrConflictingDataFiles }
 
 	_, err := tbl.doCommit(context.Background(), nil, nil,
 		withCommitBranch(MainBranch),
@@ -121,7 +121,7 @@ func TestDoCommit_DivergedSentinelIsTerminal(t *testing.T) {
 		CommitMaxRetryWaitMsKey: "2",
 	})
 
-	diverge := func(cc *conflictContext) error { return ErrCommitDiverged }
+	diverge := func(context.Context, *conflictContext) error { return ErrCommitDiverged }
 
 	_, err := tbl.doCommit(context.Background(), nil, nil,
 		withCommitBranch(MainBranch),

@@ -307,7 +307,7 @@ func TestValidateNoConflictingDataFilesInPartitions_SnapshotIsolationIsNoOp(t *t
 	)
 	require.NoError(t, err)
 
-	require.NoError(t, validateNoConflictingDataFilesInPartitions(ctx, []iceberg.DataFile{df.Build()}, IsolationSnapshot))
+	require.NoError(t, validateNoConflictingDataFilesInPartitions(t.Context(), ctx, []iceberg.DataFile{df.Build()}, IsolationSnapshot))
 }
 
 func TestValidateNoConflictingDataFilesInPartitions_EmptyInputsNoOp(t *testing.T) {
@@ -319,8 +319,8 @@ func TestValidateNoConflictingDataFilesInPartitions_EmptyInputsNoOp(t *testing.T
 	ctx, err := newConflictContext(meta, meta, MainBranch, nil, true)
 	require.NoError(t, err)
 
-	require.NoError(t, validateNoConflictingDataFilesInPartitions(ctx, nil, IsolationSerializable))
-	require.NoError(t, validateNoConflictingDataFilesInPartitions(ctx, []iceberg.DataFile{}, IsolationSerializable))
+	require.NoError(t, validateNoConflictingDataFilesInPartitions(t.Context(), ctx, nil, IsolationSerializable))
+	require.NoError(t, validateNoConflictingDataFilesInPartitions(t.Context(), ctx, []iceberg.DataFile{}, IsolationSerializable))
 }
 
 // ---------------------------------------------------------------------------
@@ -362,7 +362,7 @@ func TestRowDeltaValidate_DifferentPartitionAllowed(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	err = validateNoConflictingDataFilesInPartitions(ctx, []iceberg.DataFile{eqDf.Build()}, IsolationSerializable)
+	err = validateNoConflictingDataFilesInPartitions(t.Context(), ctx, []iceberg.DataFile{eqDf.Build()}, IsolationSerializable)
 	assert.NoError(t, err, "different-partition concurrent append must not be rejected")
 }
 
@@ -401,7 +401,7 @@ func TestRowDeltaValidate_SamePartitionRejected(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	err = validateNoConflictingDataFilesInPartitions(ctx, []iceberg.DataFile{eqDf.Build()}, IsolationSerializable)
+	err = validateNoConflictingDataFilesInPartitions(t.Context(), ctx, []iceberg.DataFile{eqDf.Build()}, IsolationSerializable)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrConflictingDataFiles)
 }
@@ -437,7 +437,7 @@ func TestRowDeltaValidate_NullIdentityPartitionRejected(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	err = validateNoConflictingDataFilesInPartitions(ctx, []iceberg.DataFile{eqDf.Build()}, IsolationSerializable)
+	err = validateNoConflictingDataFilesInPartitions(t.Context(), ctx, []iceberg.DataFile{eqDf.Build()}, IsolationSerializable)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrConflictingDataFiles)
 }
@@ -478,7 +478,7 @@ func TestRowDeltaValidate_UUIDPartitionSameRejected(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	err = validateNoConflictingDataFilesInPartitions(ctx, []iceberg.DataFile{eqDf.Build()}, IsolationSerializable)
+	err = validateNoConflictingDataFilesInPartitions(t.Context(), ctx, []iceberg.DataFile{eqDf.Build()}, IsolationSerializable)
 	require.Error(t, err, "same UUID partition must conflict")
 	assert.ErrorIs(t, err, ErrConflictingDataFiles)
 }
@@ -518,7 +518,7 @@ func TestRowDeltaValidate_UUIDPartitionDifferentAllowed(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	err = validateNoConflictingDataFilesInPartitions(ctx, []iceberg.DataFile{eqDf.Build()}, IsolationSerializable)
+	err = validateNoConflictingDataFilesInPartitions(t.Context(), ctx, []iceberg.DataFile{eqDf.Build()}, IsolationSerializable)
 	assert.NoError(t, err, "different UUID partition must not conflict")
 }
 
@@ -568,7 +568,7 @@ func TestRowDeltaValidate_UnpartitionedTableFallsBackToAlwaysTrue(t *testing.T) 
 	)
 	require.NoError(t, err)
 
-	err = validateNoConflictingDataFilesInPartitions(ctx, []iceberg.DataFile{eqDf.Build()}, IsolationSerializable)
+	err = validateNoConflictingDataFilesInPartitions(t.Context(), ctx, []iceberg.DataFile{eqDf.Build()}, IsolationSerializable)
 	require.Error(t, err, "unpartitioned table with concurrent append must conflict under AlwaysTrue fallback")
 	assert.ErrorIs(t, err, ErrConflictingDataFiles)
 }
@@ -663,7 +663,7 @@ func TestRowDeltaValidate_SpecEvolutionConflictDetected(t *testing.T) {
 	// eqDeletePartitionsToFilter builds Reference("region") == "us-east-1" (row space, spec A).
 	// validateAddedDataFilesMatchingFilter projects this against spec B's "region_v2"
 	// (also identity on source "region"), correctly matching the concurrent file.
-	err = validateNoConflictingDataFilesInPartitions(ctx, []iceberg.DataFile{eqDf.Build()}, IsolationSerializable)
+	err = validateNoConflictingDataFilesInPartitions(t.Context(), ctx, []iceberg.DataFile{eqDf.Build()}, IsolationSerializable)
 	require.Error(t, err, "cross-spec same-partition conflict must be detected after spec evolution")
 	assert.ErrorIs(t, err, ErrConflictingDataFiles)
 }
@@ -733,7 +733,7 @@ func TestRowDeltaValidate_BucketTransformFallsBackToAlwaysTrue(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	err = validateNoConflictingDataFilesInPartitions(ctx, []iceberg.DataFile{eqDf.Build()}, IsolationSerializable)
+	err = validateNoConflictingDataFilesInPartitions(t.Context(), ctx, []iceberg.DataFile{eqDf.Build()}, IsolationSerializable)
 	require.Error(t, err, "bucket-partitioned eq-delete must trigger conservative AlwaysTrue fallback")
 	assert.ErrorIs(t, err, ErrConflictingDataFiles)
 }
@@ -798,7 +798,7 @@ func TestRowDeltaValidate_DayTransformFallsBackToAlwaysTrue(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	err = validateNoConflictingDataFilesInPartitions(ctx, []iceberg.DataFile{eqDf.Build()}, IsolationSerializable)
+	err = validateNoConflictingDataFilesInPartitions(t.Context(), ctx, []iceberg.DataFile{eqDf.Build()}, IsolationSerializable)
 	require.Error(t, err, "day-partitioned eq-delete must trigger conservative AlwaysTrue fallback even for a different day")
 	assert.ErrorIs(t, err, ErrConflictingDataFiles)
 }

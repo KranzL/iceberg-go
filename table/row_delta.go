@@ -234,7 +234,7 @@ func (rd *RowDelta) Commit(ctx context.Context) error {
 		// live DVs whose referenced data file this delta adds a
 		// replacement for; validateRemovedDeletes checks each is
 		// actually removed.
-		resolvedRemovals, replacedLive, err := rd.resolveRemovedDeletes(fs, meta)
+		resolvedRemovals, replacedLive, err := rd.resolveRemovedDeletes(ctx, fs, meta)
 		if err != nil {
 			return err
 		}
@@ -405,7 +405,11 @@ func (rd *RowDelta) validateRemovedDeletes(resolved, replacedLive []iceberg.Data
 // live. This piggybacks on the manifest walk the removals already
 // need; deltas without removals do not pay for it (nor get it — see
 // AddDeletes).
-func (rd *RowDelta) resolveRemovedDeletes(fs iceio.IO, meta *MetadataBuilder) (resolved, replacedLive []iceberg.DataFile, _ error) {
+//
+// The snapshot's delete manifests are read with a bounded worker pool;
+// per-manifest results are merged in manifest order so resolution is
+// deterministic, and the first read error cancels the remaining reads.
+func (rd *RowDelta) resolveRemovedDeletes(ctx context.Context, fs iceio.IO, meta *MetadataBuilder) (resolved, replacedLive []iceberg.DataFile, _ error) {
 	snap := rd.txn.planningSnapshot(meta)
 	if snap == nil {
 		return nil, nil, errors.New("cannot remove delete files from a table without an existing snapshot")
@@ -423,23 +427,54 @@ func (rd *RowDelta) resolveRemovedDeletes(fs iceio.IO, meta *MetadataBuilder) (r
 		}
 	}
 
+	manifests, err := snap.Manifests(fs)
+	if err != nil {
+		return nil, nil, err
+	}
+	deleteManifests := make([]iceberg.ManifestFile, 0, len(manifests))
+	for _, m := range manifests {
+		if m.ManifestContent() == iceberg.ManifestContentDeletes {
+			deleteManifests = append(deleteManifests, m)
+		}
+	}
+
+	type removedDeletesScan struct {
+		wanted       []iceberg.DataFile
+		replacedLive []iceberg.DataFile
+	}
+	partials, err := mapManifestsOrdered(ctx, 0, deleteManifests,
+		func(gctx context.Context, m iceberg.ManifestFile) (removedDeletesScan, error) {
+			var out removedDeletesScan
+			for entry, err := range manifestEntriesWithCancel(gctx, m, fs, false) {
+				if err != nil {
+					return out, err
+				}
+				if entry.Status() == iceberg.EntryStatusDELETED {
+					continue
+				}
+				df := entry.DataFile()
+				if _, ok := want[df.FilePath()]; ok {
+					out.wanted = append(out.wanted, df)
+				}
+				if ref := explicitReferencedDataFile(df); IsDeletionVector(df) && ref != "" {
+					if _, ok := addedRefs[ref]; ok {
+						out.replacedLive = append(out.replacedLive, df)
+					}
+				}
+			}
+
+			return out, nil
+		})
+	if err != nil {
+		return nil, nil, err
+	}
+
 	liveByPath := make(map[string][]iceberg.DataFile, len(rd.removedDels))
-	for entry, err := range snap.entries(fs, iceberg.ManifestContentDeletes) {
-		if err != nil {
-			return nil, nil, err
-		}
-		if entry.Status() == iceberg.EntryStatusDELETED {
-			continue
-		}
-		df := entry.DataFile()
-		if _, ok := want[df.FilePath()]; ok {
+	for _, p := range partials {
+		for _, df := range p.wanted {
 			liveByPath[df.FilePath()] = append(liveByPath[df.FilePath()], df)
 		}
-		if ref := explicitReferencedDataFile(df); IsDeletionVector(df) && ref != "" {
-			if _, ok := addedRefs[ref]; ok {
-				replacedLive = append(replacedLive, df)
-			}
-		}
+		replacedLive = append(replacedLive, p.replacedLive...)
 	}
 
 	seenKeys := make(map[pathRefKey]struct{}, len(rd.removedDels))
@@ -530,7 +565,7 @@ func (rd *RowDelta) resolveRemovedDeletes(fs iceio.IO, meta *MetadataBuilder) (r
 //
 // Fast appends alongside a RowDelta see no validators from RowDelta:
 // data-only commits are as safe as a fastAppend.
-func (rd *RowDelta) validate(cc *conflictContext) error {
+func (rd *RowDelta) validate(ctx context.Context, cc *conflictContext) error {
 	meta, err := rd.txn.txnMeta()
 	if err != nil {
 		return err
@@ -567,7 +602,7 @@ func (rd *RowDelta) validate(cc *conflictContext) error {
 	}
 
 	if len(referenced) > 0 {
-		if err := validateDataFilesExist(cc, referenced); err != nil {
+		if err := validateDataFilesExist(ctx, cc, referenced); err != nil {
 			return err
 		}
 	}
@@ -587,9 +622,9 @@ func (rd *RowDelta) validate(cc *conflictContext) error {
 
 		var conflictErr error
 		if currentSpec == nil || currentSpec.NumFields() == 0 {
-			conflictErr = validateNoConflictingDataFiles(cc, iceberg.AlwaysTrue{}, level)
+			conflictErr = validateNoConflictingDataFiles(ctx, cc, iceberg.AlwaysTrue{}, level)
 		} else {
-			conflictErr = validateNoConflictingDataFilesInPartitions(cc, eqDeleteFiles, level)
+			conflictErr = validateNoConflictingDataFilesInPartitions(ctx, cc, eqDeleteFiles, level)
 		}
 		if conflictErr != nil {
 			return conflictErr

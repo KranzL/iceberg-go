@@ -125,7 +125,7 @@ func runPosDeleteConflictCheck(t *testing.T, rewrittenFiles []iceberg.DataFile, 
 	ctx := buildPartitionedContext(t, writerBaseMeta, listPath, writerBaseID, concSnapshotID)
 	require.Len(t, ctx.concurrent, 1)
 
-	return validateNoNewDeletesForRewrittenFiles(ctx, rewrittenFiles)
+	return validateNoNewDeletesForRewrittenFiles(t.Context(), ctx, rewrittenFiles)
 }
 
 func TestReadIsolationLevel(t *testing.T) {
@@ -386,8 +386,8 @@ func TestValidateDataFilesExist_EmptyInput(t *testing.T) {
 	ctx, err := newConflictContext(meta, meta, MainBranch, nil, true)
 	require.NoError(t, err)
 
-	require.NoError(t, validateDataFilesExist(ctx, nil))
-	require.NoError(t, validateDataFilesExist(ctx, []string{}))
+	require.NoError(t, validateDataFilesExist(t.Context(), ctx, nil))
+	require.NoError(t, validateDataFilesExist(t.Context(), ctx, []string{}))
 }
 
 func TestValidateNoNewDeletesForRewrittenFiles_EmptyInputs(t *testing.T) {
@@ -399,12 +399,12 @@ func TestValidateNoNewDeletesForRewrittenFiles_EmptyInputs(t *testing.T) {
 	require.NoError(t, err)
 
 	// Empty rewrittenFiles.
-	require.NoError(t, validateNoNewDeletesForRewrittenFiles(ctx, nil))
-	require.NoError(t, validateNoNewDeletesForRewrittenFiles(ctx, []iceberg.DataFile{}))
+	require.NoError(t, validateNoNewDeletesForRewrittenFiles(t.Context(), ctx, nil))
+	require.NoError(t, validateNoNewDeletesForRewrittenFiles(t.Context(), ctx, []iceberg.DataFile{}))
 
 	// Non-empty rewrittenFiles but no concurrent snapshots.
 	rewritten := newTestDataFile(t, *iceberg.UnpartitionedSpec, "a.parquet", nil)
-	require.NoError(t, validateNoNewDeletesForRewrittenFiles(ctx, []iceberg.DataFile{rewritten}))
+	require.NoError(t, validateNoNewDeletesForRewrittenFiles(t.Context(), ctx, []iceberg.DataFile{rewritten}))
 }
 
 // posDeleteBoundsFile builds a position-delete DataFile whose file_path
@@ -746,8 +746,8 @@ func TestValidateAddedDataFilesMatchingFilter_NoConcurrent(t *testing.T) {
 	ctx, err := newConflictContext(meta, meta, MainBranch, nil, true)
 	require.NoError(t, err)
 
-	require.NoError(t, validateAddedDataFilesMatchingFilter(ctx, iceberg.AlwaysTrue{}))
-	require.NoError(t, validateAddedDataFilesMatchingFilter(ctx, nil))
+	require.NoError(t, validateAddedDataFilesMatchingFilter(t.Context(), ctx, iceberg.AlwaysTrue{}))
+	require.NoError(t, validateAddedDataFilesMatchingFilter(t.Context(), ctx, nil))
 }
 
 func TestValidateAddedDataFilesMatchingFilterUsesFileMetrics(t *testing.T) {
@@ -771,7 +771,7 @@ func TestValidateAddedDataFilesMatchingFilterUsesFileMetrics(t *testing.T) {
 			listPath := writeTestManifestList(t, dir, concID, []iceberg.ManifestFile{mf})
 			ctx := buildPartitionedContext(t, base, listPath, baseID, concID)
 
-			err := validateAddedDataFilesMatchingFilter(ctx,
+			err := validateAddedDataFilesMatchingFilter(t.Context(), ctx,
 				iceberg.EqualTo(iceberg.Reference("id"), int64(5)))
 			if tt.wantConflict {
 				require.ErrorIs(t, err, ErrConflictingDataFiles)
@@ -791,7 +791,7 @@ func TestValidateAddedDataFilesMatchingFilterWithMissingBounds(t *testing.T) {
 	listPath := writeTestManifestList(t, dir, concID, []iceberg.ManifestFile{mf})
 	ctx := buildPartitionedContext(t, base, listPath, baseID, concID)
 
-	err := validateAddedDataFilesMatchingFilter(ctx,
+	err := validateAddedDataFilesMatchingFilter(t.Context(), ctx,
 		iceberg.EqualTo(iceberg.Reference("id"), int64(5)))
 	require.ErrorIs(t, err, ErrConflictingDataFiles,
 		"missing bounds must not make a data file look non-conflicting")
@@ -862,7 +862,7 @@ func TestValidateNoConflictingDataFiles_SnapshotIsolationIsNoOp(t *testing.T) {
 	ctx, err := newConflictContext(meta, meta, MainBranch, nil, true)
 	require.NoError(t, err)
 
-	require.NoError(t, validateNoConflictingDataFiles(ctx, iceberg.AlwaysTrue{}, IsolationSnapshot))
+	require.NoError(t, validateNoConflictingDataFiles(t.Context(), ctx, iceberg.AlwaysTrue{}, IsolationSnapshot))
 }
 
 type conflictValidationStatIO struct {
@@ -905,7 +905,7 @@ func TestConflictValidationReusesSharedManifestReads(t *testing.T) {
 		return nil
 	}
 	for range 2 {
-		require.NoError(t, ctx.forEachAddedEntry(iceberg.ManifestContentData, visit))
+		require.NoError(t, ctx.forEachAddedEntry(t.Context(), iceberg.ManifestContentData, visit))
 	}
 
 	assert.Equal(t, 2, visited)
@@ -929,12 +929,12 @@ func TestConflictValidationCachesFullyReadManifestAfterEarlyExit(t *testing.T) {
 	}
 
 	stop := errors.New("stop validation")
-	err := ctx.forEachAddedEntry(iceberg.ManifestContentData, func(Snapshot, iceberg.ManifestEntry) error {
+	err := ctx.forEachAddedEntry(t.Context(), iceberg.ManifestContentData, func(Snapshot, iceberg.ManifestEntry) error {
 		return stop
 	})
 	require.ErrorIs(t, err, stop)
 
-	require.NoError(t, ctx.forEachAddedEntry(iceberg.ManifestContentData, func(Snapshot, iceberg.ManifestEntry) error {
+	require.NoError(t, ctx.forEachAddedEntry(t.Context(), iceberg.ManifestContentData, func(Snapshot, iceberg.ManifestEntry) error {
 		return nil
 	}))
 	assert.Equal(t, 1, tio.openCount[manifestListPath])
@@ -978,8 +978,8 @@ func TestConflictValidationSharesManifestAfterDataFileEarlyExit(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	require.NoError(t, validateDataFilesExist(ctx, []string{dataPath}))
-	err = validateAddedDataFilesMatchingFilter(ctx, iceberg.AlwaysTrue{})
+	require.NoError(t, validateDataFilesExist(t.Context(), ctx, []string{dataPath}))
+	err = validateAddedDataFilesMatchingFilter(t.Context(), ctx, iceberg.AlwaysTrue{})
 	require.ErrorIs(t, err, ErrConflictingDataFiles)
 
 	assert.Equal(t, 1, tio.openCount[manifestListPath])

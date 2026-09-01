@@ -499,8 +499,9 @@ func yieldAllManifests(
 // conflictValidatorFunc runs a single producer's client-side conflict
 // check against a pre-built conflictContext. Validators return a wrapped
 // ErrCommit* sentinel on retryable conflict, ErrCommitDiverged on
-// terminal divergence, or nil on success.
-type conflictValidatorFunc func(cc *conflictContext) error
+// terminal divergence, or nil on success. ctx bounds the validator's
+// manifest reads; cancelling it aborts the remaining checks.
+type conflictValidatorFunc func(ctx context.Context, cc *conflictContext) error
 
 // commitOpts controls optional behavior of doCommit beyond the core
 // updates/requirements loop. All fields are zero-valued by default and
@@ -720,7 +721,7 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 				return nil, ccErr
 			}
 			for _, v := range co.validators {
-				if vErr := v(cc); vErr != nil {
+				if vErr := v(retryCtx, cc); vErr != nil {
 					return nil, vErr
 				}
 			}

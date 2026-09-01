@@ -310,8 +310,8 @@ func (r *rewriteManifests) record(toRewrite, merged, kept []iceberg.ManifestFile
 	return nil
 }
 
-func (r *rewriteManifests) validate(*conflictContext) error { return nil }
-func (r *rewriteManifests) needsValidation() bool           { return false }
+func (r *rewriteManifests) validate(context.Context, *conflictContext) error { return nil }
+func (r *rewriteManifests) needsValidation() bool                            { return false }
 
 // manifestActiveFiles sums the active (added + existing) data files across
 // manifests. It uses the manifest header counts when present and falls back to

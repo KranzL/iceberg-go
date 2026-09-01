@@ -81,7 +81,7 @@ func TestValidateDataFilesExist_TreatsConcurrentlyRemovedFileAsMissing(t *testin
 
 	// Control: while the file is live on the head, it satisfies existence.
 	ccLive := &conflictContext{current: tbl.metadata, branch: MainBranch, fs: fs}
-	require.NoError(t, validateDataFilesExist(ccLive, []string{dataFile.FilePath()}))
+	require.NoError(t, validateDataFilesExist(t.Context(), ccLive, []string{dataFile.FilePath()}))
 
 	// A compaction rewrites the file away, leaving a DELETED tombstone on the
 	// head's data manifests.
@@ -92,7 +92,7 @@ func TestValidateDataFilesExist_TreatsConcurrentlyRemovedFileAsMissing(t *testin
 
 	// The tombstone must not be mistaken for a live file: existence fails.
 	ccRemoved := &conflictContext{current: tbl2.metadata, branch: MainBranch, fs: fs}
-	err = validateDataFilesExist(ccRemoved, []string{dataFile.FilePath()})
+	err = validateDataFilesExist(t.Context(), ccRemoved, []string{dataFile.FilePath()})
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrDataFilesMissing)
 }

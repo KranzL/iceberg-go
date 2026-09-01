@@ -1305,7 +1305,7 @@ func (e *errorOnDeletedEntries) deletedEntries(_ context.Context, _ *Snapshot) (
 	return nil, e.err
 }
 
-func (e *errorOnDeletedEntries) validate(_ *conflictContext) error {
+func (e *errorOnDeletedEntries) validate(_ context.Context, _ *conflictContext) error {
 	return nil
 }
 

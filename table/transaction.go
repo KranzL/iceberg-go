@@ -904,6 +904,49 @@ func (t *Transaction) Append(ctx context.Context, rdr array.RecordReader, snapsh
 	return t.apply(updates, reqs)
 }
 
+// resolveReplacedDataFiles scans the planning snapshot's live files to resolve
+// each path in setToDelete to its DataFile and to reject additions whose path
+// the table already references. Manifests are read with a bounded worker pool
+// and per-manifest results are merged in manifest order, matching the serial
+// single-pass scan; the first error cancels the remaining reads.
+func resolveReplacedDataFiles(ctx context.Context, s *Snapshot, fs io.IO, setToDelete, setToAdd map[string]struct{}, concurrency int) ([]iceberg.DataFile, error) {
+	manifests, err := s.Manifests(fs)
+	if err != nil {
+		return nil, err
+	}
+
+	partials, err := mapManifestsOrdered(ctx, concurrency, manifests,
+		func(gctx context.Context, m iceberg.ManifestFile) ([]iceberg.DataFile, error) {
+			var marked []iceberg.DataFile
+			for entry, err := range manifestEntriesWithCancel(gctx, m, fs, true) {
+				if err != nil {
+					return nil, err
+				}
+				df := entry.DataFile()
+
+				if _, ok := setToDelete[df.FilePath()]; ok {
+					marked = append(marked, df)
+				}
+
+				if _, ok := setToAdd[df.FilePath()]; ok {
+					return nil, fmt.Errorf("cannot add files that are already referenced by table, files: %s", df.FilePath())
+				}
+			}
+
+			return marked, nil
+		})
+	if err != nil {
+		return nil, err
+	}
+
+	markedForDeletion := make([]iceberg.DataFile, 0, len(setToDelete))
+	for _, p := range partials {
+		markedForDeletion = append(markedForDeletion, p...)
+	}
+
+	return markedForDeletion, nil
+}
+
 // ReplaceFiles is actually just an overwrite operation with multiple
 // files deleted and added.
 //
@@ -958,19 +1001,9 @@ func (t *Transaction) ReplaceDataFiles(ctx context.Context, filesToDelete, files
 		return err
 	}
 
-	markedForDeletion := make([]iceberg.DataFile, 0, len(setToDelete))
-	for df, err := range s.dataFiles(fs, nil) {
-		if err != nil {
-			return err
-		}
-
-		if _, ok := setToDelete[df.FilePath()]; ok {
-			markedForDeletion = append(markedForDeletion, df)
-		}
-
-		if _, ok := setToAdd[df.FilePath()]; ok {
-			return fmt.Errorf("cannot add files that are already referenced by table, files: %s", df.FilePath())
-		}
+	markedForDeletion, err := resolveReplacedDataFiles(ctx, s, fs, setToDelete, setToAdd, 0)
+	if err != nil {
+		return err
 	}
 
 	if len(markedForDeletion) != len(setToDelete) {
@@ -1385,10 +1418,11 @@ func validateAddedDeletionVectorTargets(
 type WriteOption func(*dataFileCfg)
 
 type dataFileCfg struct {
-	skipAutoNameMapping bool
-	skipDuplicateCheck  bool
-	rewriteSemantics    bool
-	dataSequenceNumber  *int64
+	skipAutoNameMapping   bool
+	skipDuplicateCheck    bool
+	rewriteSemantics      bool
+	dataSequenceNumber    *int64
+	validationConcurrency int
 }
 
 // withRewriteSemantics marks an overwrite/replace operation as a
@@ -1628,19 +1662,9 @@ func (t *Transaction) ReplaceDataFilesWithDataFiles(ctx context.Context, filesTo
 		return err
 	}
 
-	markedForDeletion := make([]iceberg.DataFile, 0, len(setToDelete))
-	for df, err := range s.dataFiles(fs, nil) {
-		if err != nil {
-			return err
-		}
-
-		if _, ok := setToDelete[df.FilePath()]; ok {
-			markedForDeletion = append(markedForDeletion, df)
-		}
-
-		if _, ok := setToAdd[df.FilePath()]; ok {
-			return fmt.Errorf("cannot add files that are already referenced by table, files: %s", df.FilePath())
-		}
+	markedForDeletion, err := resolveReplacedDataFiles(ctx, s, fs, setToDelete, setToAdd, cfg.validationConcurrency)
+	if err != nil {
+		return err
 	}
 
 	if len(markedForDeletion) != len(setToDelete) {
@@ -1851,8 +1875,139 @@ func (t *Transaction) replaceFiles(ctx context.Context, dataFilesToDelete, dataF
 		return err
 	}
 
-	// Scan all entries (data + delete files) in a single pass to validate
-	// that all files to delete/remove actually exist in the table.
+	// Scan all entries (data + delete files) to validate that all files to
+	// delete/remove actually exist in the table. Manifests are read with a
+	// bounded worker pool and the per-manifest results are merged in
+	// manifest order, so the merged state matches the serial single-pass
+	// scan; the first error cancels the remaining reads.
+	type replaceScanLiveData struct {
+		path  string
+		state rewriteFileState
+	}
+	type replaceScanDVRemoval struct {
+		ref     string
+		df      iceberg.DataFile
+		withSeq bool
+		seq     int64
+		content iceberg.ManifestEntryContent
+	}
+	type replaceScanPartial struct {
+		live             []replaceScanLiveData
+		markedData       []iceberg.DataFile
+		markedDelete     []iceberg.DataFile
+		markedAutoDelete []iceberg.DataFile
+		dvRemovals       []replaceScanDVRemoval
+		removedSeqs      []int64
+		removedContents  []iceberg.ManifestEntryContent
+		survivingPos     []rewriteFileState
+	}
+
+	snapshotManifests, err := s.Manifests(fs)
+	if err != nil {
+		return err
+	}
+	partials, err := mapManifestsOrdered(ctx, cfg.validationConcurrency, snapshotManifests,
+		func(gctx context.Context, m iceberg.ManifestFile) (replaceScanPartial, error) {
+			var out replaceScanPartial
+			for entry, err := range manifestEntriesWithCancel(gctx, m, fs, false) {
+				if err != nil {
+					return out, err
+				}
+				df := entry.DataFile()
+				path := df.FilePath()
+				isData := df.ContentType() == iceberg.EntryContentData
+				isLive := entry.Status() != iceberg.EntryStatusDELETED
+				if isData && isLive {
+					out.live = append(out.live, replaceScanLiveData{
+						path:  path,
+						state: rewriteFileState{file: df, dataSequenceNumber: entry.SequenceNum()},
+					})
+				}
+				if _, ok := setToDelete[path]; ok && isData {
+					out.markedData = append(out.markedData, df)
+				}
+				if !isData {
+					if _, ok := setDeleteFilesToRemove[path]; ok {
+						out.markedDelete = append(out.markedDelete, df)
+						if seq := entry.SequenceNum(); seq >= 0 {
+							out.removedSeqs = append(out.removedSeqs, seq)
+							out.removedContents = append(out.removedContents, df.ContentType())
+						} else {
+							return out, fmt.Errorf("delete file %s has no data sequence number in the current snapshot", path)
+						}
+					} else if _, ok := autoSetDeleteFilesToRemove[path]; ok {
+						out.markedAutoDelete = append(out.markedAutoDelete, df)
+					} else if ref := iceberginternal.BorrowedDataFileReferencedDataFile(df); IsDeletionVector(df) && ref != nil {
+						if _, ok := dvRefsToRemove[*ref]; ok {
+							seq := entry.SequenceNum()
+							if seq < 0 {
+								return out, fmt.Errorf("deletion vector %s has no data sequence number in the current snapshot", path)
+							}
+							out.dvRemovals = append(out.dvRemovals, replaceScanDVRemoval{
+								ref: *ref, df: df, withSeq: true, seq: seq, content: df.ContentType(),
+							})
+						} else if _, ok := autoDVRefsToRemove[*ref]; ok {
+							out.dvRemovals = append(out.dvRemovals, replaceScanDVRemoval{ref: *ref, df: df})
+						}
+					}
+				}
+				if _, ok := setToAdd[path]; ok {
+					return out, fmt.Errorf("cannot add files that are already referenced by table, files: %s", path)
+				}
+				if _, ok := setDeleteFilesToAdd.regularPaths[path]; ok {
+					return out, fmt.Errorf("cannot add files that are already referenced by table, files: %s", path)
+				}
+				if _, ok := setDeleteFilesToAdd.dvPaths[path]; ok && isLive {
+					if !IsDeletionVector(df) {
+						return out, fmt.Errorf("cannot add deletion vector container path already referenced by a non-DV file: %s", path)
+					}
+					if offset, length := df.ContentOffset(), df.ContentSizeInBytes(); offset != nil && length != nil {
+						blob := deletionVectorBlobKey{path: path, offset: *offset, length: *length}
+						if _, duplicate := setDeleteFilesToAdd.dvBlobs[blob]; duplicate {
+							return out, fmt.Errorf("cannot add deletion vector blob already referenced by table: %s at offset %d with length %d",
+								path, *offset, *length)
+						}
+					}
+				}
+
+				if !isLive || isData {
+					continue
+				}
+				if IsDeletionVector(df) {
+					ref := df.ReferencedDataFile()
+					if ref == nil {
+						continue
+					}
+					if _, addingReplacement := setDeleteFilesToAdd.dvsByRef[*ref]; !addingReplacement {
+						continue
+					}
+					if _, explicitlyRemoved := dvRefsToRemove[*ref]; explicitlyRemoved {
+						continue
+					}
+					if _, automaticallyRemoved := autoDVRefsToRemove[*ref]; automaticallyRemoved {
+						continue
+					}
+
+					return out, fmt.Errorf("%w: deletion vector for data file %s already exists and must be replaced",
+						ErrInvalidOperation, *ref)
+				}
+				if df.ContentType() == iceberg.EntryContentPosDeletes {
+					if _, removed := setDeleteFilesToRemove[path]; !removed {
+						if _, automaticallyRemoved := autoSetDeleteFilesToRemove[path]; !automaticallyRemoved {
+							out.survivingPos = append(out.survivingPos, rewriteFileState{
+								file: df, dataSequenceNumber: entry.SequenceNum(),
+							})
+						}
+					}
+				}
+			}
+
+			return out, nil
+		})
+	if err != nil {
+		return err
+	}
+
 	markedDataForDeletion := make([]iceberg.DataFile, 0, len(setToDelete))
 	markedDeleteForRemoval := make([]iceberg.DataFile, 0, len(setDeleteFilesToRemove))
 	markedAutoDeleteForRemoval := make([]iceberg.DataFile, 0, len(autoSetDeleteFilesToRemove))
@@ -1861,94 +2016,25 @@ func (t *Transaction) replaceFiles(ctx context.Context, dataFilesToDelete, dataF
 	removedDeleteContents := make(map[iceberg.ManifestEntryContent]struct{})
 	liveDataFiles := make(map[string]rewriteFileState)
 	survivingPositionDeletes := make([]rewriteFileState, 0)
-	for entry, err := range s.entries(fs, -1) {
-		if err != nil {
-			return err
+	for _, p := range partials {
+		for _, l := range p.live {
+			liveDataFiles[l.path] = l.state
 		}
-		df := entry.DataFile()
-		path := df.FilePath()
-		isData := df.ContentType() == iceberg.EntryContentData
-		isLive := entry.Status() != iceberg.EntryStatusDELETED
-		if isData && isLive {
-			liveDataFiles[path] = rewriteFileState{file: df, dataSequenceNumber: entry.SequenceNum()}
+		markedDataForDeletion = append(markedDataForDeletion, p.markedData...)
+		markedDeleteForRemoval = append(markedDeleteForRemoval, p.markedDelete...)
+		markedAutoDeleteForRemoval = append(markedAutoDeleteForRemoval, p.markedAutoDelete...)
+		removedDeleteSequenceNumbers = append(removedDeleteSequenceNumbers, p.removedSeqs...)
+		for _, content := range p.removedContents {
+			removedDeleteContents[content] = struct{}{}
 		}
-		if _, ok := setToDelete[path]; ok && isData {
-			markedDataForDeletion = append(markedDataForDeletion, df)
-		}
-		if !isData {
-			if _, ok := setDeleteFilesToRemove[path]; ok {
-				markedDeleteForRemoval = append(markedDeleteForRemoval, df)
-				if seq := entry.SequenceNum(); seq >= 0 {
-					removedDeleteSequenceNumbers = append(removedDeleteSequenceNumbers, seq)
-					removedDeleteContents[df.ContentType()] = struct{}{}
-				} else {
-					return fmt.Errorf("delete file %s has no data sequence number in the current snapshot", path)
-				}
-			} else if _, ok := autoSetDeleteFilesToRemove[path]; ok {
-				markedAutoDeleteForRemoval = append(markedAutoDeleteForRemoval, df)
-			} else if ref := iceberginternal.BorrowedDataFileReferencedDataFile(df); IsDeletionVector(df) && ref != nil {
-				if _, ok := dvRefsToRemove[*ref]; ok {
-					markedDVsForRemoval[*ref] = df
-					if seq := entry.SequenceNum(); seq >= 0 {
-						removedDeleteSequenceNumbers = append(removedDeleteSequenceNumbers, seq)
-						removedDeleteContents[df.ContentType()] = struct{}{}
-					} else {
-						return fmt.Errorf("deletion vector %s has no data sequence number in the current snapshot", path)
-					}
-				} else if _, ok := autoDVRefsToRemove[*ref]; ok {
-					markedDVsForRemoval[*ref] = df
-				}
+		for _, dv := range p.dvRemovals {
+			markedDVsForRemoval[dv.ref] = dv.df
+			if dv.withSeq {
+				removedDeleteSequenceNumbers = append(removedDeleteSequenceNumbers, dv.seq)
+				removedDeleteContents[dv.content] = struct{}{}
 			}
 		}
-		if _, ok := setToAdd[path]; ok {
-			return fmt.Errorf("cannot add files that are already referenced by table, files: %s", path)
-		}
-		if _, ok := setDeleteFilesToAdd.regularPaths[path]; ok {
-			return fmt.Errorf("cannot add files that are already referenced by table, files: %s", path)
-		}
-		if _, ok := setDeleteFilesToAdd.dvPaths[path]; ok && isLive {
-			if !IsDeletionVector(df) {
-				return fmt.Errorf("cannot add deletion vector container path already referenced by a non-DV file: %s", path)
-			}
-			if offset, length := df.ContentOffset(), df.ContentSizeInBytes(); offset != nil && length != nil {
-				blob := deletionVectorBlobKey{path: path, offset: *offset, length: *length}
-				if _, duplicate := setDeleteFilesToAdd.dvBlobs[blob]; duplicate {
-					return fmt.Errorf("cannot add deletion vector blob already referenced by table: %s at offset %d with length %d",
-						path, *offset, *length)
-				}
-			}
-		}
-
-		if !isLive || isData {
-			continue
-		}
-		if IsDeletionVector(df) {
-			ref := df.ReferencedDataFile()
-			if ref == nil {
-				continue
-			}
-			if _, addingReplacement := setDeleteFilesToAdd.dvsByRef[*ref]; !addingReplacement {
-				continue
-			}
-			if _, explicitlyRemoved := dvRefsToRemove[*ref]; explicitlyRemoved {
-				continue
-			}
-			if _, automaticallyRemoved := autoDVRefsToRemove[*ref]; automaticallyRemoved {
-				continue
-			}
-
-			return fmt.Errorf("%w: deletion vector for data file %s already exists and must be replaced",
-				ErrInvalidOperation, *ref)
-		}
-		if df.ContentType() == iceberg.EntryContentPosDeletes {
-			if _, removed := setDeleteFilesToRemove[path]; !removed {
-				if _, automaticallyRemoved := autoSetDeleteFilesToRemove[path]; !automaticallyRemoved {
-					survivingPositionDeletes = append(survivingPositionDeletes, rewriteFileState{
-						file: df, dataSequenceNumber: entry.SequenceNum(),
-					})
-				}
-			}
-		}
+		survivingPositionDeletes = append(survivingPositionDeletes, p.survivingPos...)
 	}
 
 	addedDataSequenceNumber := nextSequenceNumber
@@ -2458,8 +2544,8 @@ func (t *Transaction) performMergeOnReadDeletion(ctx context.Context, snapshotPr
 		// RowDelta.validate: collect referenced data-file paths and run
 		// validateDataFilesExist unconditionally (no isolation gating).
 		if len(referenced) > 0 {
-			t.addValidator(func(cc *conflictContext) error {
-				return validateDataFilesExist(cc, referenced)
+			t.addValidator(func(ctx context.Context, cc *conflictContext) error {
+				return validateDataFilesExist(ctx, cc, referenced)
 			})
 		}
 	}

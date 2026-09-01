@@ -48,6 +48,7 @@ package table
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -56,6 +57,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/iceberg-go"
@@ -63,6 +66,7 @@ import (
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table/internal"
 	"github.com/google/uuid"
+	"golang.org/x/sync/errgroup"
 )
 
 // IsolationLevel controls how strictly a commit rejects concurrent
@@ -188,10 +192,12 @@ type conflictContext struct {
 	// cache is intentionally scoped to the context because all validators
 	// inspect the same immutable metadata snapshot, while ManifestFile.Entries
 	// still performs descriptor-specific inheritance for each logical read.
-	manifestIO *conflictManifestIO
+	manifestIO   *conflictManifestIO
+	manifestIOMu sync.Mutex
 
 	// Parsed manifest-list descriptors are also shared across validators.
-	manifestLists map[int64]conflictManifestList
+	manifestLists   map[int64]conflictManifestList
+	manifestListsMu sync.Mutex
 }
 
 type conflictManifestList struct {
@@ -215,8 +221,13 @@ var errConflictManifestIOReadOnly = errors.New("conflict manifest IO is read-onl
 // bound fall through to the backing IO. Later reads stream decoded entries
 // from completed bytes and let each ManifestFile descriptor apply its own
 // inheritance metadata.
+//
+// Validators read manifests through this cache from a bounded worker pool,
+// so lookup and recording are guarded by mu. The recorded byte slices are
+// immutable once stored and are served without copying.
 type conflictManifestIO struct {
 	base        iceio.IO
+	mu          sync.Mutex
 	files       map[string][]byte
 	cachedBytes int64
 }
@@ -229,7 +240,11 @@ func newConflictManifestIO(base iceio.IO) *conflictManifestIO {
 }
 
 func (c *conflictManifestIO) Open(name string) (iceio.File, error) {
-	if data, ok := c.files[name]; ok {
+	c.mu.Lock()
+	data, ok := c.files[name]
+	budget := maxConflictManifestCacheBytes - c.cachedBytes
+	c.mu.Unlock()
+	if ok {
 		return newConflictManifestFile(name, data), nil
 	}
 
@@ -237,7 +252,7 @@ func (c *conflictManifestIO) Open(name string) (iceio.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	if c.cachedBytes >= maxConflictManifestCacheBytes {
+	if budget <= 0 {
 		return f, nil
 	}
 
@@ -256,10 +271,26 @@ func (c *conflictManifestIO) Open(name string) (iceio.File, error) {
 		cache:        c,
 		name:         name,
 		expectedSize: info.Size(),
-		cacheLimit:   maxConflictManifestCacheBytes - c.cachedBytes,
+		cacheLimit:   budget,
 		cacheable:    true,
 		complete:     info.Size() == 0,
 	}, nil
+}
+
+// record stores a fully-read manifest's bytes. Concurrent readers of the same
+// path may both attempt to record; the first wins and the budget is re-checked
+// under the lock so parallel recorders cannot overshoot the cache bound.
+func (c *conflictManifestIO) record(name string, data []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.files[name]; ok {
+		return
+	}
+	if c.cachedBytes+int64(len(data)) > maxConflictManifestCacheBytes {
+		return
+	}
+	c.files[name] = data
+	c.cachedBytes += int64(len(data))
 }
 
 func (c *conflictManifestIO) Remove(string) error {
@@ -267,7 +298,10 @@ func (c *conflictManifestIO) Remove(string) error {
 }
 
 func (c *conflictManifestIO) Stat(name string) (fs.FileInfo, error) {
-	if data, ok := c.files[name]; ok {
+	c.mu.Lock()
+	data, ok := c.files[name]
+	c.mu.Unlock()
+	if ok {
 		return conflictManifestFileInfo{name: name, size: int64(len(data))}, nil
 	}
 
@@ -349,8 +383,7 @@ func (f *conflictManifestRecordingFile) Stat() (fs.FileInfo, error) {
 func (f *conflictManifestRecordingFile) Close() error {
 	err := f.base.Close()
 	if err == nil && f.cacheable && f.complete && int64(len(f.data)) == f.expectedSize {
-		f.cache.files[f.name] = f.data
-		f.cache.cachedBytes += int64(len(f.data))
+		f.cache.record(f.name, f.data)
 	}
 
 	return err
@@ -381,6 +414,8 @@ func (f conflictManifestFileInfo) IsDir() bool        { return false }
 func (f conflictManifestFileInfo) Sys() any           { return nil }
 
 func (c *conflictContext) manifestReadIO() *conflictManifestIO {
+	c.manifestIOMu.Lock()
+	defer c.manifestIOMu.Unlock()
 	if c.manifestIO == nil {
 		c.manifestIO = newConflictManifestIO(c.fs)
 	}
@@ -389,6 +424,8 @@ func (c *conflictContext) manifestReadIO() *conflictManifestIO {
 }
 
 func (c *conflictContext) manifestsFor(snap Snapshot) ([]iceberg.ManifestFile, error) {
+	c.manifestListsMu.Lock()
+	defer c.manifestListsMu.Unlock()
 	if c.manifestLists == nil {
 		c.manifestLists = make(map[int64]conflictManifestList)
 	}
@@ -475,38 +512,89 @@ func newConflictContext(base, current Metadata, branch string, fs iceio.IO, case
 // entries. Filtering on entry.SnapshotID() is the only attribution
 // that survives manifest rewrites.
 //
-// The visitor returns early if the callback returns a non-nil error.
-func (c *conflictContext) forEachAddedEntry(content iceberg.ManifestContent, visit func(Snapshot, iceberg.ManifestEntry) error) error {
+// Manifests are read with a bounded worker pool, so visit runs
+// concurrently and must be safe for parallel calls; the first error
+// cancels the remaining reads. When several manifests carry a
+// conflicting entry, which one's error is returned is not defined.
+// Work is grouped by manifest path — concurrent snapshots frequently
+// share unchanged manifests, and reading a shared path sequentially
+// within one worker lets the second logical read hit the byte cache
+// instead of re-fetching the object.
+func (c *conflictContext) forEachAddedEntry(ctx context.Context, content iceberg.ManifestContent, visit func(Snapshot, iceberg.ManifestEntry) error) error {
+	groups, err := c.groupedManifestWork(content)
+	if err != nil {
+		return err
+	}
+	if len(groups) == 0 {
+		return nil
+	}
+
+	fio := c.manifestReadIO()
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(manifestPoolSize(0))
+	for _, group := range groups {
+		g.Go(func() error {
+			if err := context.Cause(gctx); err != nil {
+				return err
+			}
+			for _, w := range group {
+				for entry, err := range manifestEntriesWithCancel(gctx, w.mf, fio, false) {
+					if err != nil {
+						return fmt.Errorf("loading entries for concurrent snapshot %d: %w", w.snap.SnapshotID, err)
+					}
+					if entry.Status() != iceberg.EntryStatusADDED {
+						continue
+					}
+					if entry.SnapshotID() != w.snap.SnapshotID {
+						// Entry was inherited from a prior snapshot and is
+						// not attributable to this concurrent commit.
+						continue
+					}
+					if err := visit(w.snap, entry); err != nil {
+						return err
+					}
+				}
+			}
+
+			return nil
+		})
+	}
+
+	return g.Wait()
+}
+
+type concurrentManifestWork struct {
+	snap Snapshot
+	mf   iceberg.ManifestFile
+}
+
+// groupedManifestWork enumerates the (concurrent snapshot, manifest)
+// pairs whose manifests match content, grouped by manifest path so a
+// manifest shared by several concurrent snapshots is handled by a
+// single worker in snapshot-walk order.
+func (c *conflictContext) groupedManifestWork(content iceberg.ManifestContent) ([][]concurrentManifestWork, error) {
+	groupIdx := make(map[string]int)
+	var groups [][]concurrentManifestWork
 	for _, snap := range c.concurrent {
 		manifests, err := c.manifestsFor(snap)
 		if err != nil {
-			return fmt.Errorf("loading entries for concurrent snapshot %d: %w", snap.SnapshotID, err)
+			return nil, fmt.Errorf("loading manifests for concurrent snapshot %d: %w", snap.SnapshotID, err)
 		}
 		for _, mf := range manifests {
 			if content >= 0 && mf.ManifestContent() != content {
 				continue
 			}
-
-			for entry, err := range mf.Entries(c.manifestReadIO(), false) {
-				if err != nil {
-					return fmt.Errorf("loading entries for concurrent snapshot %d: %w", snap.SnapshotID, err)
-				}
-				if entry.Status() != iceberg.EntryStatusADDED {
-					continue
-				}
-				if entry.SnapshotID() != snap.SnapshotID {
-					// Entry was inherited from a prior snapshot and is
-					// not attributable to this concurrent commit.
-					continue
-				}
-				if err := visit(snap, entry); err != nil {
-					return err
-				}
+			w := concurrentManifestWork{snap: snap, mf: mf}
+			if gi, ok := groupIdx[mf.FilePath()]; ok {
+				groups[gi] = append(groups[gi], w)
+			} else {
+				groupIdx[mf.FilePath()] = len(groups)
+				groups = append(groups, []concurrentManifestWork{w})
 			}
 		}
 	}
 
-	return nil
+	return groups, nil
 }
 
 // validateDataFilesExist verifies that every file path in
@@ -531,32 +619,47 @@ func (c *conflictContext) forEachAddedEntry(content iceberg.ManifestContent, vis
 //
 // Cost is O(all data manifests × all entries) regardless of
 // len(referencedPaths); callers MUST batch referenced paths into a
-// single call rather than calling once per path.
-func validateDataFilesExist(ctx *conflictContext, referencedPaths []string) error {
+// single call rather than calling once per path. The head's data
+// manifests are read with a bounded worker pool; once every referenced
+// path has been found the remaining reads are cancelled, and the first
+// read error cancels the rest.
+func validateDataFilesExist(ctx context.Context, cc *conflictContext, referencedPaths []string) error {
 	if len(referencedPaths) == 0 {
 		return nil
 	}
-	needed := make(map[string]struct{}, len(referencedPaths))
+	wanted := make(map[string]struct{}, len(referencedPaths))
 	for _, p := range referencedPaths {
-		needed[p] = struct{}{}
+		wanted[p] = struct{}{}
 	}
 
-	head := ctx.current.SnapshotByName(ctx.branch)
+	head := cc.current.SnapshotByName(cc.branch)
 	if head == nil {
-		return fmt.Errorf("%w: branch %q missing on current metadata", ErrCommitDiverged, ctx.branch)
+		return fmt.Errorf("%w: branch %q missing on current metadata", ErrCommitDiverged, cc.branch)
 	}
 
-	manifests, err := ctx.manifestsFor(*head)
+	manifests, err := cc.manifestsFor(*head)
 	if err != nil {
 		return fmt.Errorf("iterating data files for current head %d: %w", head.SnapshotID, err)
 	}
+	dataManifests := make([]iceberg.ManifestFile, 0, len(manifests))
 	for _, mf := range manifests {
-		if mf.ManifestContent() != iceberg.ManifestContentData {
-			continue
+		if mf.ManifestContent() == iceberg.ManifestContentData {
+			dataManifests = append(dataManifests, mf)
 		}
-		for entry, err := range mf.Entries(ctx.manifestReadIO(), false) {
+	}
+
+	var (
+		foundMu   sync.Mutex
+		found     = make(map[string]struct{}, len(wanted))
+		remaining atomic.Int64
+	)
+	remaining.Store(int64(len(wanted)))
+
+	fio := cc.manifestReadIO()
+	_, err = mapManifestsOrdered(ctx, 0, dataManifests, func(gctx context.Context, mf iceberg.ManifestFile) (struct{}, error) {
+		for entry, err := range manifestEntriesWithCancel(gctx, mf, fio, false) {
 			if err != nil {
-				return fmt.Errorf("iterating data files for current head %d: %w", head.SnapshotID, err)
+				return struct{}{}, fmt.Errorf("iterating data files for current head %d: %w", head.SnapshotID, err)
 			}
 			// A DELETED entry means the file was removed (e.g. rewritten by a
 			// concurrent compaction); it is no longer live data a pos-delete can
@@ -565,20 +668,35 @@ func validateDataFilesExist(ctx *conflictContext, referencedPaths []string) erro
 				continue
 			}
 			path := entry.DataFile().FilePath()
-			delete(needed, path)
+			if _, ok := wanted[path]; !ok {
+				continue
+			}
+			foundMu.Lock()
+			if _, dup := found[path]; !dup {
+				found[path] = struct{}{}
+				remaining.Add(-1)
+			}
+			foundMu.Unlock()
+			if remaining.Load() == 0 {
+				return struct{}{}, errAllReferencedFilesFound
+			}
 		}
-		if len(needed) == 0 {
-			return nil
-		}
+
+		return struct{}{}, nil
+	})
+	if err != nil && !errors.Is(err, errAllReferencedFilesFound) {
+		return err
 	}
 
-	if len(needed) == 0 {
+	if remaining.Load() == 0 {
 		return nil
 	}
 
-	missing := make([]string, 0, len(needed))
-	for p := range needed {
-		missing = append(missing, p)
+	missing := make([]string, 0, len(wanted))
+	for p := range wanted {
+		if _, ok := found[p]; !ok {
+			missing = append(missing, p)
+		}
 	}
 	sort.Strings(missing)
 	sample := missing
@@ -588,6 +706,11 @@ func validateDataFilesExist(ctx *conflictContext, referencedPaths []string) erro
 
 	return fmt.Errorf("%w: %d files missing, e.g. %v", ErrDataFilesMissing, len(missing), sample)
 }
+
+// errAllReferencedFilesFound is an internal sentinel used to cancel the
+// remaining manifest reads once validateDataFilesExist has located every
+// referenced path. It is never returned to callers.
+var errAllReferencedFilesFound = errors.New("all referenced data files found")
 
 // validateAddedDataFilesMatchingFilter returns an error if any
 // concurrent snapshot added a data file whose partition satisfies the
@@ -605,91 +728,133 @@ func validateDataFilesExist(ctx *conflictContext, referencedPaths []string) erro
 //     one actual added file's partition value satisfies the filter.
 //  3. The surviving files are evaluated against their column metrics so
 //     files whose bounds cannot match the filter are ignored.
-func validateAddedDataFilesMatchingFilter(ctx *conflictContext, filter iceberg.BooleanExpression) error {
-	if len(ctx.concurrent) == 0 {
+//
+// Manifests are read with a bounded worker pool. Each worker owns its
+// own evaluator state (the memoized per-spec projections and the
+// metrics evaluator mutate per-call scratch state, so they cannot be
+// shared across goroutines); a detected conflict or read error cancels
+// the remaining reads. When several concurrent snapshots conflict,
+// which one's error is returned is not defined.
+func validateAddedDataFilesMatchingFilter(ctx context.Context, cc *conflictContext, filter iceberg.BooleanExpression) error {
+	if len(cc.concurrent) == 0 {
 		return nil
 	}
 	if filter == nil {
 		filter = iceberg.AlwaysTrue{}
 	}
 
-	// Per-spec projected filter, memoized per spec id. Concurrent
-	// snapshots may have been written against different spec ids
-	// after a spec evolution, so each needs its own projection.
-	// Reuses the same projection/evaluator helpers the scanner uses
-	// (buildPartitionProjection, buildManifestEvaluator,
-	// buildPartitionEvaluator) so there is one code path that pruning
-	// semantics flow through.
-	partitionFilters := newKeyDefaultMapWrapErr(func(specID int) (iceberg.BooleanExpression, error) {
-		return buildPartitionProjection(specID, ctx.current, ctx.current.CurrentSchema(), filter, ctx.caseSensitive)
-	})
-	manifestEvals := newKeyDefaultMapWrapErr(func(specID int) (func(iceberg.ManifestFile) (bool, error), error) {
-		return buildManifestEvaluator(specID, ctx.current, ctx.current.CurrentSchema(), partitionFilters, ctx.caseSensitive)
-	})
-	partitionEvals := newKeyDefaultMapWrapErr(func(specID int) (func(iceberg.DataFile) (bool, error), error) {
-		return buildPartitionEvaluator(specID, ctx.current, ctx.current.CurrentSchema(), partitionFilters, ctx.caseSensitive)
-	})
-	// Eval copies each file's metrics into fresh evaluator state, so this
-	// evaluator can be reused across concurrent manifests.
-	// includeEmptyFiles=false is intentional: an empty file has no rows that
-	// can match the filter and must not create a conflict.
-	metricsEval, err := newInclusiveMetricsEvaluator(ctx.current.CurrentSchema(), filter, ctx.caseSensitive, false)
+	groups, err := cc.groupedManifestWork(iceberg.ManifestContentData)
 	if err != nil {
-		return fmt.Errorf("failed to build metrics evaluator: %w", err)
+		return err
+	}
+	if len(groups) == 0 {
+		return nil
 	}
 
-	for _, snap := range ctx.concurrent {
-		manifests, err := ctx.manifestsFor(snap)
+	fio := cc.manifestReadIO()
+	workCh := make(chan []concurrentManifestWork)
+	g, gctx := errgroup.WithContext(ctx)
+	for range min(manifestPoolSize(0), len(groups)) {
+		g.Go(func() error {
+			// Per-spec projected filter, memoized per spec id. Concurrent
+			// snapshots may have been written against different spec ids
+			// after a spec evolution, so each needs its own projection.
+			// Reuses the same projection/evaluator helpers the scanner uses
+			// (buildPartitionProjection, buildManifestEvaluator,
+			// buildPartitionEvaluator) so there is one code path that pruning
+			// semantics flow through.
+			partitionFilters := newKeyDefaultMapWrapErr(func(specID int) (iceberg.BooleanExpression, error) {
+				return buildPartitionProjection(specID, cc.current, cc.current.CurrentSchema(), filter, cc.caseSensitive)
+			})
+			manifestEvals := newKeyDefaultMapWrapErr(func(specID int) (func(iceberg.ManifestFile) (bool, error), error) {
+				return buildManifestEvaluator(specID, cc.current, cc.current.CurrentSchema(), partitionFilters, cc.caseSensitive)
+			})
+			partitionEvals := newKeyDefaultMapWrapErr(func(specID int) (func(iceberg.DataFile) (bool, error), error) {
+				return buildPartitionEvaluator(specID, cc.current, cc.current.CurrentSchema(), partitionFilters, cc.caseSensitive)
+			})
+			// Eval copies each file's metrics into fresh evaluator state, so this
+			// evaluator can be reused across this worker's manifests.
+			// includeEmptyFiles=false is intentional: an empty file has no rows that
+			// can match the filter and must not create a conflict.
+			metricsEval, err := newInclusiveMetricsEvaluator(cc.current.CurrentSchema(), filter, cc.caseSensitive, false)
+			if err != nil {
+				return fmt.Errorf("failed to build metrics evaluator: %w", err)
+			}
+
+			for group := range workCh {
+				for _, w := range group {
+					if err := validateAddedFilesInManifest(gctx, fio, w.snap, w.mf, filter,
+						manifestEvals, partitionEvals, metricsEval); err != nil {
+						return err
+					}
+				}
+			}
+
+			return nil
+		})
+	}
+	g.Go(func() error {
+		defer close(workCh)
+		for _, group := range groups {
+			select {
+			case workCh <- group:
+			case <-gctx.Done():
+				return nil
+			}
+		}
+
+		return nil
+	})
+
+	return g.Wait()
+}
+
+func validateAddedFilesInManifest(ctx context.Context, fio iceio.IO, snap Snapshot, mf iceberg.ManifestFile,
+	filter iceberg.BooleanExpression,
+	manifestEvals *keyDefaultMapErr[int, func(iceberg.ManifestFile) (bool, error)],
+	partitionEvals *keyDefaultMapErr[int, func(iceberg.DataFile) (bool, error)],
+	metricsEval func(iceberg.DataFile) (bool, error),
+) error {
+	mEval, err := manifestEvals.Get(int(mf.PartitionSpecID()))
+	if err != nil {
+		return fmt.Errorf("failed to build manifest evaluator for spec %d: %w", mf.PartitionSpecID(), err)
+	}
+	keep, err := mEval(mf)
+	if err != nil {
+		return err
+	}
+	if !keep {
+		return nil
+	}
+
+	pEval, err := partitionEvals.Get(int(mf.PartitionSpecID()))
+	if err != nil {
+		return fmt.Errorf("failed to build partition evaluator for spec %d: %w", mf.PartitionSpecID(), err)
+	}
+	for e, err := range manifestEntriesWithCancel(ctx, mf, fio, false) {
 		if err != nil {
-			return fmt.Errorf("loading manifests for concurrent snapshot %d: %w", snap.SnapshotID, err)
+			return fmt.Errorf("reading entries from manifest %s: %w", mf.FilePath(), err)
 		}
-		for _, mf := range manifests {
-			if mf.ManifestContent() != iceberg.ManifestContentData {
-				continue
-			}
-
-			mEval, err := manifestEvals.Get(int(mf.PartitionSpecID()))
-			if err != nil {
-				return fmt.Errorf("failed to build manifest evaluator for spec %d: %w", mf.PartitionSpecID(), err)
-			}
-			keep, err := mEval(mf)
-			if err != nil {
-				return err
-			}
-			if !keep {
-				continue
-			}
-
-			pEval, err := partitionEvals.Get(int(mf.PartitionSpecID()))
-			if err != nil {
-				return fmt.Errorf("failed to build partition evaluator for spec %d: %w", mf.PartitionSpecID(), err)
-			}
-			for e, err := range mf.Entries(ctx.manifestReadIO(), false) {
-				if err != nil {
-					return fmt.Errorf("reading entries from manifest %s: %w", mf.FilePath(), err)
-				}
-				if e.Status() != iceberg.EntryStatusADDED || e.SnapshotID() != snap.SnapshotID {
-					continue
-				}
-				matches, err := pEval(e.DataFile())
-				if err != nil {
-					return err
-				}
-				if !matches {
-					continue
-				}
-				matches, err = metricsEval(e.DataFile())
-				if err != nil {
-					return fmt.Errorf("evaluating metrics for data file %s: %w", e.DataFile().FilePath(), err)
-				}
-				if !matches {
-					continue
-				}
-
-				return fmt.Errorf("%w: snapshot %d added data file %s matching filter %s",
-					ErrConflictingDataFiles, snap.SnapshotID, e.DataFile().FilePath(), filter)
-			}
+		if e.Status() != iceberg.EntryStatusADDED || e.SnapshotID() != snap.SnapshotID {
+			continue
 		}
+		matches, err := pEval(e.DataFile())
+		if err != nil {
+			return err
+		}
+		if !matches {
+			continue
+		}
+		matches, err = metricsEval(e.DataFile())
+		if err != nil {
+			return fmt.Errorf("evaluating metrics for data file %s: %w", e.DataFile().FilePath(), err)
+		}
+		if !matches {
+			continue
+		}
+
+		return fmt.Errorf("%w: snapshot %d added data file %s matching filter %s",
+			ErrConflictingDataFiles, snap.SnapshotID, e.DataFile().FilePath(), filter)
 	}
 
 	return nil
@@ -703,12 +868,12 @@ func validateAddedDataFilesMatchingFilter(ctx *conflictContext, filter iceberg.B
 // Under IsolationSnapshot this validator is a no-op: concurrent
 // appends are allowed and will simply land in the same partition
 // alongside the new deletes.
-func validateNoConflictingDataFiles(ctx *conflictContext, filter iceberg.BooleanExpression, level IsolationLevel) error {
+func validateNoConflictingDataFiles(ctx context.Context, cc *conflictContext, filter iceberg.BooleanExpression, level IsolationLevel) error {
 	if level != IsolationSerializable {
 		return nil
 	}
 
-	return validateAddedDataFilesMatchingFilter(ctx, filter)
+	return validateAddedDataFilesMatchingFilter(ctx, cc, filter)
 }
 
 // validateNoConflictingDataFilesInPartitions is like
@@ -729,21 +894,21 @@ func validateNoConflictingDataFiles(ctx *conflictContext, filter iceberg.Boolean
 // directly.
 //
 // Under IsolationSnapshot this validator is a no-op.
-func validateNoConflictingDataFilesInPartitions(ctx *conflictContext, eqDeleteFiles []iceberg.DataFile, level IsolationLevel) error {
+func validateNoConflictingDataFilesInPartitions(ctx context.Context, cc *conflictContext, eqDeleteFiles []iceberg.DataFile, level IsolationLevel) error {
 	if level != IsolationSerializable {
 		return nil
 	}
 
-	if len(ctx.concurrent) == 0 || len(eqDeleteFiles) == 0 {
+	if len(cc.concurrent) == 0 || len(eqDeleteFiles) == 0 {
 		return nil
 	}
 
-	filter, err := eqDeletePartitionsToFilter(eqDeleteFiles, ctx.current)
+	filter, err := eqDeletePartitionsToFilter(eqDeleteFiles, cc.current)
 	if err != nil {
 		return fmt.Errorf("building partition conflict filter: %w", err)
 	}
 
-	return validateNoConflictingDataFiles(ctx, filter, level)
+	return validateNoConflictingDataFiles(ctx, cc, filter, level)
 }
 
 type equalityDeletePartitionSpecInfo struct {
@@ -919,8 +1084,8 @@ func eqDeletePartitionsToFilter(files []iceberg.DataFile, meta Metadata) (iceber
 //     Java's approach for RewriteFiles and avoids silently losing
 //     deletes. A follow-up PR will accept optional partition-overlap
 //     hints to narrow this check.
-func validateNoNewDeletesForRewrittenFiles(ctx *conflictContext, rewrittenFiles []iceberg.DataFile) error {
-	if len(rewrittenFiles) == 0 || len(ctx.concurrent) == 0 {
+func validateNoNewDeletesForRewrittenFiles(ctx context.Context, cc *conflictContext, rewrittenFiles []iceberg.DataFile) error {
+	if len(rewrittenFiles) == 0 || len(cc.concurrent) == 0 {
 		return nil
 	}
 
@@ -936,7 +1101,7 @@ func validateNoNewDeletesForRewrittenFiles(ctx *conflictContext, rewrittenFiles 
 		rewrittenPartitions[key] = struct{}{}
 	}
 
-	return ctx.forEachAddedEntry(iceberg.ManifestContentDeletes, func(snap Snapshot, e iceberg.ManifestEntry) error {
+	return cc.forEachAddedEntry(ctx, iceberg.ManifestContentDeletes, func(snap Snapshot, e iceberg.ManifestEntry) error {
 		df := e.DataFile()
 		switch df.ContentType() {
 		case iceberg.EntryContentPosDeletes:
