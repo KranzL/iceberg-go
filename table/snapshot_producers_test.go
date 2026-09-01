@@ -630,7 +630,7 @@ func TestOverwriteFilesExistingManifestsClosesWriterOnError(t *testing.T) {
 	sp := newOverwriteFilesProducer(OpOverwrite, txn, mem, nil, nil)
 	sp.deleteDataFile(deletedFile)
 
-	_, err = sp.existingManifests(&snap)
+	_, err = sp.existingManifests(t.Context(), &snap)
 	require.ErrorIs(t, err, errLimitedWrite)
 }
 
@@ -1269,7 +1269,7 @@ func TestOverwriteExistingManifestsClosesUnderlyingFile(t *testing.T) {
 
 	trackIO.writers = make(map[string]*trackingWriteCloser)
 
-	_, err = sp.existingManifests(&snap)
+	_, err = sp.existingManifests(t.Context(), &snap)
 	require.NoError(t, err, "existingManifests should succeed")
 
 	unclosed := trackIO.GetUnclosedWriters()
@@ -1289,7 +1289,7 @@ func (e *errorOnDeletedEntries) processManifests(manifests []iceberg.ManifestFil
 	return manifests, nil
 }
 
-func (e *errorOnDeletedEntries) existingManifests(_ *Snapshot) ([]iceberg.ManifestFile, error) {
+func (e *errorOnDeletedEntries) existingManifests(_ context.Context, _ *Snapshot) ([]iceberg.ManifestFile, error) {
 	return nil, nil
 }
 
@@ -1889,7 +1889,7 @@ func TestExistingManifests_SupersededDVSurvivesRetry(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, parentManifests, 1)
 
-	got, err := sp.existingManifests(parent)
+	got, err := sp.existingManifests(t.Context(), parent)
 	require.NoError(t, err)
 	require.Len(t, got, 1, "the peer's deletes manifest must be inherited")
 	require.Equal(t, parentManifests[0].FilePath(), got[0].FilePath(),
@@ -1913,7 +1913,7 @@ func TestExistingManifests_ExactDVStillExpunged(t *testing.T) {
 
 	parent := writeParentSnapshotWithDeletesManifest(t, wfs, spec, 94, "expunged", staleDV)
 
-	got, err := sp.existingManifests(parent)
+	got, err := sp.existingManifests(t.Context(), parent)
 	require.NoError(t, err)
 	require.Empty(t, got, "a manifest whose only entry is the removed DV is dropped")
 

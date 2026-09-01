@@ -1418,11 +1418,13 @@ func validateAddedDeletionVectorTargets(
 type WriteOption func(*dataFileCfg)
 
 type dataFileCfg struct {
-	skipAutoNameMapping   bool
-	skipDuplicateCheck    bool
-	rewriteSemantics      bool
-	dataSequenceNumber    *int64
-	validationConcurrency int
+	skipAutoNameMapping               bool
+	skipDuplicateCheck                bool
+	rewriteSemantics                  bool
+	dataSequenceNumber                *int64
+	validationConcurrency             int
+	deletedEntryCollectionConcurrency int
+	manifestStagingConcurrency        int
 }
 
 // withRewriteSemantics marks an overwrite/replace operation as a
@@ -1468,6 +1470,43 @@ func WithoutAutoNameMapping() WriteOption {
 func WithoutDuplicateCheck() WriteOption {
 	return func(cfg *dataFileCfg) {
 		cfg.skipDuplicateCheck = true
+	}
+}
+
+// WithReplaceValidationConcurrency bounds the worker pool used to read
+// manifests while validating a replace operation's inputs against the
+// current snapshot (resolving files to delete, rejecting re-added
+// paths). A non-positive value keeps the default, the process-wide
+// max-workers config.
+func WithReplaceValidationConcurrency(n int) WriteOption {
+	return func(cfg *dataFileCfg) {
+		if n > 0 {
+			cfg.validationConcurrency = n
+		}
+	}
+}
+
+// WithReplaceDeletedEntryCollectionConcurrency bounds the worker pool
+// used to collect DELETE entries from the parent snapshot's manifests
+// when producing a replace/overwrite snapshot. A non-positive value
+// keeps the default, the process-wide max-workers config.
+func WithReplaceDeletedEntryCollectionConcurrency(n int) WriteOption {
+	return func(cfg *dataFileCfg) {
+		if n > 0 {
+			cfg.deletedEntryCollectionConcurrency = n
+		}
+	}
+}
+
+// WithReplaceManifestStagingConcurrency bounds the worker pool used to
+// filter and rewrite the parent snapshot's manifests carried into a
+// replace/overwrite snapshot. A non-positive value keeps the default,
+// the process-wide max-workers config.
+func WithReplaceManifestStagingConcurrency(n int) WriteOption {
+	return func(cfg *dataFileCfg) {
+		if n > 0 {
+			cfg.manifestStagingConcurrency = n
+		}
 	}
 }
 
@@ -1684,9 +1723,12 @@ func (t *Transaction) ReplaceDataFilesWithDataFiles(ctx context.Context, filesTo
 
 	commitUUID := uuid.New()
 	updater := t.updateSnapshot(wfs, snapshotProps, op).mergeOverwrite(&commitUUID, nil)
+	// mergeOverwrite guarantees an *overwriteFiles producerImpl.
+	producer := updater.producerImpl.(*overwriteFiles)
+	producer.deletedEntryCollectionConcurrency = cfg.deletedEntryCollectionConcurrency
+	producer.manifestStagingConcurrency = cfg.manifestStagingConcurrency
 	if cfg.rewriteSemantics {
-		// mergeOverwrite guarantees an *overwriteFiles producerImpl.
-		updater.producerImpl.(*overwriteFiles).skipDefaultValidator = true
+		producer.skipDefaultValidator = true
 	}
 	if cfg.dataSequenceNumber != nil {
 		updater.setNewDataFilesDataSequenceNumber(*cfg.dataSequenceNumber)
@@ -2148,9 +2190,12 @@ func (t *Transaction) replaceFiles(ctx context.Context, dataFilesToDelete, dataF
 
 	commitUUID := uuid.New()
 	updater := t.updateSnapshot(wfs, snapshotProps, op).mergeOverwrite(&commitUUID, nil)
+	// mergeOverwrite guarantees an *overwriteFiles producerImpl.
+	producer := updater.producerImpl.(*overwriteFiles)
+	producer.deletedEntryCollectionConcurrency = cfg.deletedEntryCollectionConcurrency
+	producer.manifestStagingConcurrency = cfg.manifestStagingConcurrency
 	if cfg.rewriteSemantics {
-		// mergeOverwrite guarantees an *overwriteFiles producerImpl.
-		updater.producerImpl.(*overwriteFiles).skipDefaultValidator = true
+		producer.skipDefaultValidator = true
 	}
 	if cfg.dataSequenceNumber != nil {
 		updater.setNewDataFilesDataSequenceNumber(*cfg.dataSequenceNumber)
